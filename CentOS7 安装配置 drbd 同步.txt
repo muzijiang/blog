@@ -1,0 +1,88 @@
+主从服务器都需要添加如下分区
+
+/dev/sdb1 为 500M  # 作为 create-md 这个分区一定不能用 mkfs 来格式化
+/dev/sdb2 为 2G    # 数据
+
+开始安装
+
+rpm -Uvh https://www.elrepo.org/elrepo-release-7.0-3.el7.elrepo.noarch.rpm
+yum -y install drbd84-utils kmod-drbd84
+
+让内核加载 drbd 模块
+
+modprobe drbd
+lsmod |grep drbd
+
+echo "modprobe drbd">>/etc/rc.local    # 加入开机自启动
+chmod +x /etc/rc.d/rc.local
+
+创建全局配置
+
+mv /etc/drbd.d/global_common.conf /etc/drbd.d/global_common.conf.bak
+cat  > /etc/drbd.d/global_common.conf <<-EOF
+global {
+  usage-count no;
+}
+common {
+  net {
+    protocol C;
+  }
+}
+EOF
+
+创建资源配置文件
+
+cat  > /etc/drbd.d/postgresql_data.res <<-EOF
+
+resource postgresql_data {
+  disk /dev/sdb1;
+  device /dev/drbd0;
+  meta-disk /dev/sdb2[0];
+  # meta-disk internal;
+  on pgcluster02 {
+    address 192.168.56.107:7788;
+  }
+  on pgcluster03 {
+    address 192.168.56.108:7788;
+  }
+}
+EOF
+
+drbdadm create-md postgresql_data
+drbdadm up postgresql_data
+
+刚开始启动为非一致性状态
+
+drbdadm status postgresql_data
+
+postgresql_data role:Secondary
+  disk:Inconsistent
+  peer role:Secondary
+    replication:Established peer-disk:Inconsistent
+
+
+主从同步，强制主覆盖从数据
+
+systemctl start drbd
+drbdadm -- --overwrite-data-of-peer primary postgresql_data
+drbdadm status postgresql_data
+
+postgresql_data role:Primary
+  disk:UpToDate
+  peer role:Secondary
+    replication:SyncSource peer-disk:Inconsistent done:1.61
+
+cat /proc/drbd
+
+version: 8.4.11-1 (api:1/proto:86-101)
+GIT-hash: 66145a308421e9c124ec391a7848ac20203bb03c build by mockbuild@, 2020-04-05 02:58:18
+ 0: cs:SyncSource ro:Primary/Secondary ds:UpToDate/Inconsistent C r-----
+    ns:180960 nr:0 dw:0 dr:183032 al:8 bm:0 lo:0 pe:0 ua:0 ap:0 ep:1 wo:f oos:331040
+        [======>.............] sync'ed: 36.6% (331040/512000)K
+        finish: 0:00:33 speed: 9,816 (8,616) K/sec
+
+格式化drbd设备，挂载磁盘
+
+mkfs.xfs /dev/drbd0
+mount /dev/drbd0 /postgresql
+
