@@ -1,0 +1,144 @@
+postgresql 安装
+
+https://yum.postgresql.org/repopackages.php
+
+yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+
+yum install -y postgresql96-server postgresql96-contrib
+
+systemctl start postgresql-9.6
+systemctl enable postgresql-9.6
+
+systemctl status firewalld
+systemctl stop firewalld
+systemctl disable firewalld
+
+
+主库初始化
+
+[postgres@pgcluster03 ~]$ /usr/pgsql-9.6/bin/initdb -D /pgsql/9.6/data
+The files belonging to this database system will be owned by user "postgres".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "en_US.UTF-8".
+The default database encoding has accordingly been set to "UTF8".
+The default text search configuration will be set to "english".
+
+Data page checksums are disabled.
+
+fixing permissions on existing directory /pgsql/9.6/data ... ok
+creating subdirectories ... ok
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default timezone ... Asia/Shanghai
+selecting dynamic shared memory implementation ... posix
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+
+WARNING: enabling "trust" authentication for local connections
+You can change this by editing pg_hba.conf or using the option -A, or
+--auth-local and --auth-host, the next time you run initdb.
+
+Success. You can now start the database server using:
+
+    /usr/pgsql-9.6/bin/pg_ctl -D /pgsql/9.6/data -l logfile start
+
+
+配置远程访问
+
+
+vim /pgsql/9.6/data/postgresql.conf
+
+listen_addresses = '*'          # what IP address(es) to listen on;
+                                        # comma-separated list of addresses;
+                                        # defaults to 'localhost'; use '*' for all
+
+data_directory = '/pgsql/9.6/data'          # use data in another directory
+                                        # (change requires restart)
+
+
+vim /pgsql/9.6/data/pg_hba.conf
+
+host all all 0.0.0.0/0 md5
+
+systemctl restart postgresql-9.6.service
+
+su - postgres
+psql -U postgres
+alter user postgres with encrypted password 'abc123';
+
+
+
+主从复制
+
+主库
+
+#创建复制数据库用户
+CREATE ROLE replica login replication encrypted password '123456';
+
+#修改配置文件pg_hba.conf,允许远程客户端使用密码登录
+host    all             all             0.0.0.0/0               md5
+
+#修改配置文件pg_hba.conf,增加postgres用户，进行同步
+host  replication postgres 192.168.56.109/24 md5
+
+#修改配置文件postgresql.conf,修改以下几个地方
+wal_level = hot_standby  # 这个是设置主为wal的主机
+max_wal_senders = 32 # 这个设置了可以最多有几个流复制连接，差不多有几个从，就设置几个
+wal_keep_segments = 256 ＃ 设置流复制保留的最多的xlog数目
+wal_sender_timeout = 60s ＃ 设置流复制主机发送数据的超时时间
+max_connections = 100 # 这个设置要注意下，从库的max_connections必须要大于主库的
+
+synchronous_standby_names = 'mydb_standby1'(与异步流复制区别！！！)
+
+#重启主库数据库
+systemctl restart postgresql-9.6.service
+
+pg_ctl -D /pgsql/9.6/data -l logfile start
+
+
+从库
+
+#登录postgre用户，测试连接主库数据库是否正常
+psql -h 192.168.56.108
+
+#若链接正常，删除从库data目录下文件
+rm -rf data/*
+
+#通过pg_basebackup命令行在从库上生成基础备份
+pg_basebackup -h 192.168.56.108 -U postgres -F p -x -P -R -D /pgsql/9.6/data -l replbackup20200531
+#参数说明：
+#        -h:指定连接的数据库的主机名或IP地址，这里就是主库的ip
+#        -U:指定连接的用户名，此处是我们刚才创建的专门负责流复制的repl用户
+#        -F:指定了输出的格式，支持p（原样输出）或者t（tar格式输出）
+#        -x:表示备份开始后，启动另一个流复制连接从主库接收WAL日志
+#        -P:表示允许在备份过程中实时的打印备份的进度
+#        -R:表示会在备份结束后自动生成recovery.conf文件，这样也就避免了手动创建
+#        -D:指定把备份写到哪个目录
+#        -l:表示指定一个备份的标识，运行命令后看到如下进度提示就说明生成基础备份成功
+
+#修改从库数据目录下的postgresql.conf文件，将hot_standby改为启用状态
+hot_standby=on
+
+#编辑recovery.conf配置文件(与异步流复制区别)，9.6中该文件废弃，可忽略
+在primary_conninfo中加入application_name=mydb_standby1，例如
+primary_conninfo = 'host=192.168.56.109 port=5432 user=repuser password=123456 application_name=mydb_standby1'
+
+#重启从数据库
+systemctl restart postgresql-9.6.service
+
+pg_ctl -D /pgsql/9.6/data -l logfile start
+
+
+发现问题：
+
+1. 创建表、插入数据后命令行不返回，夯死状态
+
+Ctrl-C 后报错，但目标端能查询到插入后的数据
+
+DETAIL:  The transaction has already committed locally, but might not have been replicated to the standby
+
+设置 synchronous_commit 参数为 local
+
